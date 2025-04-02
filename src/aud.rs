@@ -1,55 +1,64 @@
-use anyhow::{Context, Result};
+use eyre::{ContextCompat, Result};
 use hound::{SampleFormat, WavReader};
 use minimp3::{Decoder, Frame};
 use optivorbis::{Remuxer, VorbisOptimizerSettings, remuxer::ogg_to_ogg::Settings};
-use std::io::Cursor;
+use std::{io::Cursor, panic::catch_unwind};
 use vorbis_rs::VorbisDecoder;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioKind {
-	Mp3,
-	Ogg,
-	Wav,
+	Vorbis,
+	Wave,
+	Mpeg3,
 }
 
-pub fn optimise_vorbis(bytes: &[u8]) -> Result<Vec<u8>> {
-	let mut settings = VorbisOptimizerSettings::default();
-	settings.comment_fields_action = optivorbis::VorbisCommentFieldsAction::Delete;
-	settings.vendor_string_action = optivorbis::VorbisVendorStringAction::Empty;
+pub fn optimise(bytes: &[u8], kind: AudioKind) -> Result<Option<Vec<u8>>> {
+	match kind {
+		AudioKind::Vorbis => {
+			let mut settings = VorbisOptimizerSettings::default();
+			settings.comment_fields_action = optivorbis::VorbisCommentFieldsAction::Delete;
+			settings.vendor_string_action = optivorbis::VorbisVendorStringAction::Empty;
 
-	let options = Settings {
-		error_on_no_vorbis_streams: false,
-		// not sure how safe this is for osu skins
-		ignore_start_sample_offset: true,
-		..Default::default()
-	};
+			let options = Settings {
+				error_on_no_vorbis_streams: false,
+				// not sure how safe this is for osu skins
+				ignore_start_sample_offset: true,
+				..Default::default()
+			};
 
-	let encoder = optivorbis::OggToOgg::new(options, settings);
-	let mut output = Vec::with_capacity(bytes.len());
-	encoder.remux(Cursor::new(bytes), &mut output)?;
-	Ok(output)
+			let encoder = optivorbis::OggToOgg::new(options, settings);
+			let mut output = Vec::with_capacity(bytes.len());
+			encoder.remux(Cursor::new(bytes), &mut output)?;
+			if output.len() >= bytes.len() {
+				Ok(None)
+			} else {
+				Ok(Some(output))
+			}
+		}
+		_ => Ok(None),
+	}
 }
 
-pub fn convert_to_vorbis(bytes: &[u8], kind: &AudioKind) -> Result<Option<Vec<u8>>> {
+pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind) -> Result<Vec<u8>> {
 	if bytes.is_empty() {
-		return Ok(None);
+		eyre::bail!("this is an empty file");
 	}
 
 	let (pcm_data, sample_rate, channels) = match kind {
-		AudioKind::Mp3 => mp3_to_pcm(bytes)?,
-		AudioKind::Wav => wav_to_pcm(bytes)?,
-		AudioKind::Ogg => vorbis_to_pcm(bytes)?,
+		AudioKind::Mpeg3 => mp3_to_pcm(bytes)?,
+		AudioKind::Wave => wav_to_pcm(bytes)?,
+		AudioKind::Vorbis => vorbis_to_pcm(bytes)?,
 	};
 
 	if sample_rate == 0 || pcm_data.is_empty() || is_silent(&pcm_data) {
-		return Ok(None);
+		eyre::bail!("this is an empty file");
 	}
 
-	if matches!(kind, AudioKind::Ogg) {
-		return Ok(Some(bytes.to_vec()));
+	if matches!(kind, AudioKind::Vorbis) {
+		return Ok(bytes.to_vec());
 	}
 
-	pcm_to_vorbis(pcm_data, sample_rate, channels).map(Some)
+	pcm_to_vorbis(pcm_data, sample_rate, channels)
 }
 
 fn is_silent(pcm_data: &[f32]) -> bool {
@@ -57,32 +66,36 @@ fn is_silent(pcm_data: &[f32]) -> bool {
 }
 
 fn mp3_to_pcm(bytes: &[u8]) -> Result<(Vec<f32>, u64, u32)> {
-	let mut decoder = Decoder::new(bytes);
-	let mut pcm = Vec::new();
-	let (mut rate, mut ch) = (None, None);
+	// this library sometimes panics. dunno why. lol.
+	catch_unwind(|| {
+		let mut decoder = Decoder::new(bytes);
+		let mut pcm = Vec::new();
+		let (mut rate, mut ch) = (None, None);
 
-	while let Ok(Frame {
-		data,
-		sample_rate,
-		channels,
-		..
-	}) = decoder.next_frame()
-	{
-		rate.get_or_insert(sample_rate);
-		ch.get_or_insert(channels);
+		while let Ok(Frame {
+			data,
+			sample_rate,
+			channels,
+			..
+		}) = decoder.next_frame()
+		{
+			rate.get_or_insert(sample_rate);
+			ch.get_or_insert(channels);
 
-		if rate != Some(sample_rate) || ch != Some(channels) {
-			anyhow::bail!("mp3 stream parameters changed");
+			if rate != Some(sample_rate) || ch != Some(channels) {
+				eyre::bail!("mp3 stream parameters changed");
+			}
+
+			pcm.extend(data.iter().map(|&s| s as f32 / 32768.0));
 		}
 
-		pcm.extend(data.iter().map(|&s| s as f32 / 32768.0));
-	}
-
-	Ok((
-		pcm,
-		rate.context("no mp3 frames")? as u64,
-		ch.context("no channels")? as u32,
-	))
+		Ok((
+			pcm,
+			rate.context("no mp3 frames")? as u64,
+			ch.context("no channels")? as u32,
+		))
+	})
+	.unwrap_or_else(|_| eyre::bail!("mp3 decoder panic"))
 }
 
 fn wav_to_pcm(bytes: &[u8]) -> Result<(Vec<f32>, u64, u32)> {

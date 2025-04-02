@@ -9,7 +9,7 @@ it does something or other
   - [x] minimise empty files
   - [x] optimise file size
 - [ ] ? optimise other files
-  - [ ] ?jpeg
+  - [x] jpeg
   - [ ] ?mp3
   - [ ] ?wav
   - [ ] skin.ini
@@ -18,7 +18,6 @@ it does something or other
 - [ ] remove dead files
 - [ ] lossy compression option
 - [ ] file-keep options
-- [ ] filetype-preserve options
 - [ ] mangle prefixes option
 - [ ] edit options
   - [ ] instafade

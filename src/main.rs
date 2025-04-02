@@ -1,163 +1,168 @@
-use anyhow::Result;
+mod cli;
+use cli::Args;
+
 use clap::Parser;
-use image::{ExtendedColorType, GenericImageView, LumaA, Pixel};
+use eyre::Result;
+use image::{GenericImageView, Pixel};
+use memmap2::Mmap;
 use mtzip::ZipArchive as MtZipArchive;
 use piz::ZipArchive;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{
-	cmp::Ordering,
-	collections::HashMap,
-	fs::{File, read},
-	io::Cursor,
-};
+use std::{collections::HashMap, fs::File, io::Read, time::Instant};
 
-mod cli;
-use cli::*;
 use optiosk::*;
 
+const EMPTY_PNG: &[u8; 67] = include_bytes!("1x1.png");
+
 fn main() -> Result<()> {
-	let args = Args::parse();
+	let mut args = Args::parse();
+
+	if args.output_path.as_os_str() == "OUTPUT_PATH" {
+		args.output_path = args.skin_path.with_extension("opt.osk");
+	}
+
 	rayon::ThreadPoolBuilder::new()
 		.num_threads(args.threads)
 		.build_global()?;
 
-	// pre-generate this empty image
-	let empty_png = {
-		let mut buf = Vec::with_capacity(67);
-		let img = image::ImageBuffer::<LumaA<u8>, Vec<u8>>::new(1, 1);
-		image::write_buffer_with_format(
-			&mut Cursor::new(&mut buf),
-			&img,
-			1,
-			1,
-			ExtendedColorType::La8,
-			image::ImageFormat::Png,
-		)?;
-		optimise_png(&buf)?
-	};
+	let timer = Instant::now();
 
-	let timer = std::time::Instant::now();
-	let input_bytes = read(&args.skin_path)?;
 	let mut output_file = File::create(&args.output_path)?;
-	let mut output = MtZipArchive::new();
 
-	let input_zip = ZipArchive::new(&input_bytes)?;
-	let input_size = input_bytes.len() as u64;
+	let input_file = File::open(&args.skin_path)?;
+	let input_len = input_file.metadata()?.len();
+	let memmap = unsafe { Mmap::map(&input_file)? };
+	let input = ZipArchive::new(&memmap)?;
 
-	let files = input_zip
+	let (media, others): (Vec<_>, Vec<_>) = input
 		.entries()
 		.par_iter()
-		.filter_map(|metadata| {
-			let kind = FileKind::from(metadata.path.as_std_path());
+		.filter_map(|file| {
+			|| -> Result<Option<_>> {
+				let mut reader = input.read(file)?;
+				let mut bytes = Vec::with_capacity(file.size);
+				reader.read_to_end(&mut bytes)?;
+				let mut file_data: FileData = file.path.as_std_path().into();
 
-			if matches!(kind, FileKind::Unknown) {
-				return None;
-			}
+				match file_data.kind {
+					FileKind::Image(img_kind) => {
+						let the_img = image::load_from_memory_with_format(
+							&bytes,
+							match img_kind {
+								ImageKind::Jpeg => image::ImageFormat::Jpeg,
+								ImageKind::Png => image::ImageFormat::Png,
+							},
+						)?;
 
-			let mut bytes: Vec<u8> = match input_zip.read(&metadata).and_then(|mut r| {
-				let mut buf = Vec::with_capacity(metadata.size);
-				r.read_to_end(&mut buf).map(|_| buf).map_err(Into::into)
-			}) {
-				Ok(b) => b,
-				Err(_) => return None,
-			};
-
-			let mut path = metadata.path.to_path_buf();
-
-			match &kind {
-				FileKind::Image(ImageKind::Png) => {
-					if let Ok(optimized) = optimise_png(&bytes) {
-						bytes = optimized;
-					}
-					if is_empty_image(&bytes) {
-						bytes = empty_png.clone();
-					}
-				}
-				FileKind::Image(img_kind) => {
-					if let Ok(png) = convert_to_png(&bytes, img_kind) {
-						if should_convert(&args, FileType::Image) {
-							bytes = optimise_png(&png).unwrap_or(png);
-							path.set_extension("png");
+						// empty file optimisation step. pointless for jpeg files because
+						// they have no transparency
+						if the_img.pixels().all(|p| p.2.to_luma_alpha()[1] == 0)
+							&& img_kind == ImageKind::Png
+						{
+							bytes.clear();
+							bytes.extend_from_slice(EMPTY_PNG);
+							file_data.path.set_extension("png");
+							file_data.kind = FileKind::Image(ImageKind::Png);
+						} else {
+							if let Some(optimised) = img::optimise(&bytes, img_kind)? {
+								bytes = optimised;
+							}
 						}
-					} else if is_empty_image(&bytes) {
-						bytes = empty_png.clone();
-						path.set_extension("png");
 					}
-				}
-				FileKind::Audio(aud_kind) => {
-					if let Ok(Some(ogg)) = convert_to_vorbis(&bytes, aud_kind) {
-						if should_convert(&args, FileType::Audio) {
-							bytes = optimise_vorbis(&ogg).unwrap_or(ogg);
-							path.set_extension("ogg");
+					FileKind::Audio(aud_kind) => {
+						// if this fails, stream wasnt valid to begin with. let it die.
+						if let Ok(ogg) = aud::convert_to_vorbis(&bytes, aud_kind) {
+							// if this is nothing, we have a worse file
+							if let Some(optimised) = aud::optimise(&ogg, aud_kind)? {
+								bytes = optimised;
+							} else {
+								bytes = ogg;
+							}
+							file_data.path.set_extension("ogg");
+							file_data.kind = FileKind::Audio(AudioKind::Vorbis);
+						} else {
+							// i see all the dead files use .wav, so im using it here
+							bytes.clear();
+							file_data.path.set_extension("wav");
+							file_data.kind = FileKind::Audio(AudioKind::Wave);
 						}
-					} else {
-						bytes.clear();
 					}
+					FileKind::Config(_) => {}
+					FileKind::Unknown => return Ok(None),
 				}
-				_ => {}
-			}
-
-			Some(SkinFile::new(kind, path.into(), bytes))
+				Ok(Some((file_data, bytes)))
+			}()
+			.transpose()
 		})
-		.collect::<Vec<_>>();
+		// todo: this is gross
+		.collect::<Result<Vec<_>>>()?
+		.into_iter()
+		.partition(|(file, _)| matches!(file.kind, FileKind::Image(_) | FileKind::Audio(_)));
 
-	let (media, others): (Vec<_>, Vec<_>) = files.into_iter().partition(SkinFile::is_media);
+	// i dont like this whole grouping section very much either...
 	let mut groups = HashMap::new();
-
-	for file in media {
+	for (file, data) in media {
 		let stem = file.path.with_extension("");
+		let stem_str = stem.to_str().unwrap().to_string();
+		let category = match file.kind {
+			FileKind::Image(_) => 0,
+			FileKind::Audio(_) => 1,
+			_ => unreachable!(),
+		};
 		groups
-			.entry((stem, file.media_category()))
+			.entry((stem_str, category))
 			.or_insert_with(Vec::new)
-			.push(file);
+			.push((file, data));
 	}
 
-	groups
+	let selected_media: Vec<_> = groups
 		.into_iter()
-		.filter_map(|((_, category), mut group)| {
-			group.sort_by(|a, b| match category {
-				0 => a
-					.png_priority()
-					.cmp(&b.png_priority())
-					.then(a.bytes.len().cmp(&b.bytes.len())),
-				1 => a
-					.audio_priority()
-					.cmp(&b.audio_priority())
-					.then(a.bytes.len().cmp(&b.bytes.len())),
-				_ => Ordering::Equal,
-			});
-			group.into_iter().next()
+		.filter_map(|((_, category), group)| {
+			group.into_iter().min_by(|a, b| {
+				let a_prio = get_priority(&a.0, category);
+				let b_prio = get_priority(&b.0, category);
+				a_prio.cmp(&b_prio).then_with(|| a.1.len().cmp(&b.1.len()))
+			})
 		})
+		.collect();
+
+	let mut output = MtZipArchive::new();
+
+	selected_media
+		.into_iter()
 		.chain(others)
-		.for_each(|file| {
+		.for_each(|(file, data)| {
 			output
-				.add_file_from_memory(file.bytes, file.path.to_str().unwrap().to_string())
+				.add_file_from_memory(data, file.path.to_str().unwrap().to_string())
 				.done();
 		});
 
 	output.write_with_rayon(&mut output_file)?;
-	let output_size = output_file.metadata()?.len();
+	let output_len = output_file.metadata()?.len();
 
 	println!(
-		"finished in {:.2?}. size: {:.2}MiB → {:.2}MiB (change: {:.2}MiB)",
+		"finished in {:.2?}. size: {:.2}MiB => {:.2}MiB (change: {:.2}MiB)",
 		timer.elapsed(),
-		input_size as f32 / 1048576.0,
-		output_size as f32 / 1048576.0,
-		(input_size - output_size) as f32 / 1048576.0,
+		input_len as f32 / 1048576.0,
+		output_len as f32 / 1048576.0,
+		(output_len as f32 - input_len as f32) / 1048576.0,
 	);
 
 	Ok(())
 }
 
-#[inline]
-fn should_convert(args: &Args, file_type: FileType) -> bool {
-	!args.preserve_filetypes.contains(&file_type)
-		&& !args.preserve_filetypes.contains(&FileType::All)
-}
-
-#[inline]
-fn is_empty_image(bytes: &[u8]) -> bool {
-	image::load_from_memory(bytes).ok().map_or(false, |img| {
-		img.dimensions() == (1, 1) || img.pixels().all(|p| p.2.channels()[3] == 0)
-	})
+fn get_priority(file: &FileData, category: u8) -> u8 {
+	match category {
+		0 => match file.kind {
+			FileKind::Image(ImageKind::Png) => 0,
+			FileKind::Image(ImageKind::Jpeg) => 1,
+			_ => 2,
+		},
+		1 => match file.kind {
+			FileKind::Audio(AudioKind::Vorbis) => 0,
+			FileKind::Audio(AudioKind::Wave) => 1,
+			_ => 2,
+		},
+		_ => 2,
+	}
 }

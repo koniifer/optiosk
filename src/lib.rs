@@ -1,15 +1,11 @@
-use std::{
-	fmt,
-	path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub mod aud;
 pub mod img;
+pub use aud::AudioKind;
+pub use img::ImageKind;
 
-pub use aud::*;
-pub use img::*;
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
 	Image(ImageKind),
 	Audio(AudioKind),
@@ -17,15 +13,14 @@ pub enum FileKind {
 	Unknown,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigKind {
+	LazerJson,
 	SkinIni,
-	Lazer,
 }
 
-impl<T: AsRef<Path>> From<T> for FileKind {
-	fn from(path: T) -> Self {
-		let path = path.as_ref();
+impl From<&Path> for FileData {
+	fn from(path: &Path) -> Self {
 		let stem = path
 			.file_stem()
 			.and_then(|s| s.to_str())
@@ -37,65 +32,26 @@ impl<T: AsRef<Path>> From<T> for FileKind {
 			.unwrap_or_default()
 			.to_lowercase();
 
-		match ext.as_str() {
-			"png" => Self::Image(ImageKind::Png),
-			"jpg" | "jpeg" => Self::Image(img::ImageKind::Jpeg),
-			"mp3" => Self::Audio(AudioKind::Mp3),
-			"ogg" => Self::Audio(AudioKind::Ogg),
-			"wav" => Self::Audio(AudioKind::Wav),
-			"ini" if stem == "skin" => Self::Config(ConfigKind::SkinIni),
-			"json" => Self::Config(ConfigKind::Lazer),
-			_ => Self::Unknown,
+		let kind = match ext.as_str() {
+			"png" => FileKind::Image(ImageKind::Png),
+			"jpg" | "jpeg" => FileKind::Image(img::ImageKind::Jpeg),
+			"mp3" => FileKind::Audio(AudioKind::Mpeg3),
+			"ogg" => FileKind::Audio(AudioKind::Vorbis),
+			"wav" => FileKind::Audio(AudioKind::Wave),
+			"ini" if stem == "skin" => FileKind::Config(ConfigKind::SkinIni),
+			"json" => FileKind::Config(ConfigKind::LazerJson),
+			_ => FileKind::Unknown,
+		};
+
+		Self {
+			kind,
+			path: path.to_path_buf(),
 		}
 	}
 }
 
-pub struct SkinFile {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileData {
 	pub kind: FileKind,
 	pub path: PathBuf,
-	pub bytes: Vec<u8>,
-}
-
-impl SkinFile {
-	pub fn new(kind: FileKind, path: PathBuf, bytes: Vec<u8>) -> Self {
-		Self { kind, path, bytes }
-	}
-
-	pub fn is_media(&self) -> bool {
-		matches!(self.kind, FileKind::Image(_) | FileKind::Audio(_))
-	}
-
-	pub fn media_category(&self) -> u8 {
-		match self.kind {
-			FileKind::Image(_) => 0,
-			FileKind::Audio(_) => 1,
-			_ => unreachable!(),
-		}
-	}
-
-	pub fn png_priority(&self) -> u8 {
-		match &self.kind {
-			FileKind::Image(ImageKind::Png) => 0,
-			FileKind::Image(_) => 1,
-			_ => 2,
-		}
-	}
-
-	pub fn audio_priority(&self) -> u8 {
-		match &self.kind {
-			FileKind::Audio(AudioKind::Ogg) => 0,
-			FileKind::Audio(AudioKind::Wav) => 1,
-			FileKind::Audio(_) => 2,
-			_ => 3,
-		}
-	}
-}
-
-impl fmt::Debug for SkinFile {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("SkinFile")
-			.field("kind", &self.kind)
-			.field("path", &self.path)
-			.finish()
-	}
 }
