@@ -34,3 +34,7 @@ rayon = "1"
 
 [profile.release]
 strip = true
+
+[profile.dev]
+# god forbid a girl has fun
+debug-assertions = false

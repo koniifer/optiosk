@@ -1,2 +1,2 @@
 [alias]
-optiosk = "run -r -q --"
+optiosk = "run -q --"
