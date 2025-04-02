@@ -27,8 +27,6 @@ fn main() -> Result<()> {
 
 	let timer = Instant::now();
 
-	let mut output_file = File::create(&args.output_path)?;
-
 	let input_file = File::open(&args.skin_path)?;
 	let input_len = input_file.metadata()?.len();
 	let memmap = unsafe { Mmap::map(&input_file)? };
@@ -45,14 +43,24 @@ fn main() -> Result<()> {
 				let mut file_data: FileData = file.path.as_std_path().into();
 
 				match file_data.kind {
-					FileKind::Image(img_kind) => {
-						let the_img = image::load_from_memory_with_format(
-							&bytes,
-							match img_kind {
-								ImageKind::Jpeg => image::ImageFormat::Jpeg,
-								ImageKind::Png => image::ImageFormat::Png,
-							},
-						)?;
+					FileKind::Image(mut img_kind) => {
+						let guess = image::guess_format(&bytes)?;
+
+						match (guess, img_kind) {
+							(a @ image::ImageFormat::Jpeg, ImageKind::Png)
+							| (a @ image::ImageFormat::Png, ImageKind::Jpeg) => {
+								if a == image::ImageFormat::Jpeg {
+									img_kind = ImageKind::Jpeg;
+									file_data.path.set_extension("jpg");
+								} else {
+									img_kind = ImageKind::Png;
+									file_data.path.set_extension("png");
+								}
+							}
+							_ => (),
+						}
+
+						let the_img = image::load_from_memory_with_format(&bytes, guess)?;
 
 						// empty file optimisation step. pointless for jpeg files because
 						// they have no transparency
@@ -137,6 +145,7 @@ fn main() -> Result<()> {
 				.done();
 		});
 
+	let mut output_file = File::create(&args.output_path)?;
 	output.write_with_rayon(&mut output_file)?;
 	let output_len = output_file.metadata()?.len();
 
