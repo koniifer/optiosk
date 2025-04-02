@@ -22,7 +22,7 @@ pub struct Args {
         value_parser,
         action = ArgAction::Append,
         default_value = "image",
-        help = "file types to preserve (comma-separated or multiple -p flags)"
+        help = "file types to preserve. will not preserve garbage files. (comma-separated or multiple -p flags)"
     )]
 	pub preserve_filetypes: Vec<FileType>,
 }
