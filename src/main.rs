@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use mtzip::ZipArchive as MtZipArchive;
 use piz::ZipArchive;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{collections::HashMap, fs::File, io::Read, time::Instant};
+use std::{collections::HashMap, fs::File, io::Read, panic::catch_unwind, time::Instant};
 
 use optiosk::*;
 
@@ -30,7 +30,12 @@ fn main() -> Result<()> {
 	let input_file = File::open(&args.skin_path)?;
 	let input_len = input_file.metadata()?.len();
 	let memmap = unsafe { Mmap::map(&input_file)? };
-	let input = ZipArchive::new(&memmap)?;
+	let input = match catch_unwind(|| ZipArchive::new(&memmap)) {
+		Ok(i) => i?,
+		Err(_) => {
+			eyre::bail!("encountered zip decode panic (probably malformed zip file). exiting.")
+		}
+	};
 
 	let (media, others): (Vec<_>, Vec<_>) = input
 		.entries()
@@ -72,14 +77,18 @@ fn main() -> Result<()> {
 							file_data.path.set_extension("png");
 							file_data.kind = FileKind::Image(ImageKind::Png);
 						} else {
-							if let Some(optimised) = img::optimise(&bytes, img_kind)? {
+							if let Some(optimised) =
+								img::optimise(&bytes, img_kind, args.image_quality)?
+							{
 								bytes = optimised;
 							}
 						}
 					}
 					FileKind::Audio(aud_kind) => {
 						// if this fails, stream wasnt valid to begin with. let it die.
-						if let Ok(ogg) = aud::convert_to_vorbis(&bytes, aud_kind) {
+						if let Ok(ogg) =
+							aud::convert_to_vorbis(&bytes, aud_kind, args.audio_quality)
+						{
 							// if this is nothing, we have a worse file
 							if let Some(optimised) = aud::optimise(&ogg, aud_kind)? {
 								bytes = optimised;
@@ -140,8 +149,14 @@ fn main() -> Result<()> {
 		.into_iter()
 		.chain(others)
 		.for_each(|(file, data)| {
+			let len = data.len();
 			output
 				.add_file_from_memory(data, file.path.to_str().unwrap().to_string())
+				.compression_type(if len == 0 {
+					mtzip::CompressionType::Stored
+				} else {
+					mtzip::CompressionType::Deflate
+				})
 				.done();
 		});
 
@@ -150,7 +165,7 @@ fn main() -> Result<()> {
 	let output_len = output_file.metadata()?.len();
 
 	println!(
-		"finished in {:.2?}. size: {:.2}MiB => {:.2}MiB (change: {:.2}MiB)",
+		"finished in {:.3?}. size: {:.3}MiB => {:.3}MiB (change: {:.3}MiB)",
 		timer.elapsed(),
 		input_len as f32 / 1048576.0,
 		output_len as f32 / 1048576.0,

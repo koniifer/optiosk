@@ -1,5 +1,5 @@
 use bitflags::bitflags;
-use clap::Parser;
+use clap::{Parser, value_parser};
 use std::path::PathBuf;
 
 bitflags! {
@@ -40,6 +40,10 @@ pub struct Args {
 	pub output_path: PathBuf,
 	#[clap(short, long, default_value = "4")]
 	pub threads: usize,
+	#[clap(long, value_parser = value_parser!(u8).range(1..=100), default_value = "80", help = "default is 80 because minor jpeg artifacts shouldnt be noticeable. set to 100 for (theoretically) lossless compression.")]
+	pub image_quality: u8,
+	#[clap(long, value_parser = value_parser!(u8).range(1..=100), default_value = "1", help = "default is 1 because i really can't tell a difference... set to 100 for (theoretically) lossless compression.")]
+	pub audio_quality: u8,
 }
 
 fn parse_skin_items(s: &str) -> Result<SkinItems, String> {

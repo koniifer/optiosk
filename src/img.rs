@@ -1,4 +1,5 @@
 use eyre::Result;
+use std::panic::catch_unwind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageKind {
@@ -6,7 +7,7 @@ pub enum ImageKind {
 	Jpeg,
 }
 
-pub fn optimise(bytes: &[u8], kind: ImageKind) -> Result<Option<Vec<u8>>> {
+pub fn optimise(bytes: &[u8], kind: ImageKind, quality: u8) -> Result<Option<Vec<u8>>> {
 	use ImageKind::*;
 	match kind {
 		Png => {
@@ -16,7 +17,10 @@ pub fn optimise(bytes: &[u8], kind: ImageKind) -> Result<Option<Vec<u8>>> {
 					fix_errors: true,
 					optimize_alpha: true,
 					strip: oxipng::StripChunks::Safe,
-					..Default::default()
+					scale_16: if quality != 100 { true } else { false },
+					deflate: oxipng::Deflaters::Libdeflater { compression: 12 },
+					fast_evaluation: true,
+					..oxipng::Options::from_preset(3)
 				},
 			)?;
 			if optimised.is_empty() || optimised.len() >= bytes.len() {
@@ -25,16 +29,17 @@ pub fn optimise(bytes: &[u8], kind: ImageKind) -> Result<Option<Vec<u8>>> {
 				Ok(Some(optimised))
 			}
 		}
-		Jpeg => {
+		Jpeg => catch_unwind(|| {
 			let decomp = mozjpeg::Decompress::new_mem(bytes)?;
 			let colour_space = decomp.color_space();
 
 			let mut comp = mozjpeg::Compress::new(colour_space);
 
 			comp.set_size(decomp.width(), decomp.height());
-			comp.set_quality(100.0);
+			comp.set_quality(quality as f32);
 			comp.set_optimize_coding(true);
 			comp.set_optimize_scans(true);
+			comp.set_smoothing_factor(0);
 			comp.set_progressive_mode();
 
 			let mut optimised = Vec::new();
@@ -51,6 +56,7 @@ pub fn optimise(bytes: &[u8], kind: ImageKind) -> Result<Option<Vec<u8>>> {
 			} else {
 				Ok(Some(optimised))
 			}
-		}
+		})
+		.unwrap_or_else(|_| eyre::bail!("jpeg decode/encode panic")),
 	}
 }

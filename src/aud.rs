@@ -39,7 +39,7 @@ pub fn optimise(bytes: &[u8], kind: AudioKind) -> Result<Option<Vec<u8>>> {
 	}
 }
 
-pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind) -> Result<Vec<u8>> {
+pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind, quality: u8) -> Result<Vec<u8>> {
 	if bytes.is_empty() {
 		eyre::bail!("this is an empty file");
 	}
@@ -50,7 +50,7 @@ pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind) -> Result<Vec<u8>> {
 		AudioKind::Vorbis => vorbis_to_pcm(bytes)?,
 	};
 
-	if sample_rate == 0 || pcm_data.is_empty() || is_silent(&pcm_data) {
+	if sample_rate == 0 || channels == 0 || is_silent(&pcm_data) {
 		eyre::bail!("this is an empty file");
 	}
 
@@ -58,11 +58,21 @@ pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind) -> Result<Vec<u8>> {
 		return Ok(bytes.to_vec());
 	}
 
-	pcm_to_vorbis(pcm_data, sample_rate, channels)
+	pcm_to_vorbis(pcm_data, sample_rate, channels, quality)
 }
 
 fn is_silent(pcm_data: &[f32]) -> bool {
-	pcm_data.iter().all(|&sample| sample.abs() < f32::EPSILON)
+	const SILENCE_THRESHOLD: f32 = 1e-2;
+
+	if pcm_data.is_empty() {
+		return true;
+	}
+
+	let max_amplitude = pcm_data
+		.iter()
+		.fold(0.0f32, |acc, &sample| acc.max(sample.abs()));
+
+	max_amplitude < SILENCE_THRESHOLD
 }
 
 fn mp3_to_pcm(bytes: &[u8]) -> Result<(Vec<f32>, u64, u32)> {
@@ -116,7 +126,7 @@ fn wav_to_pcm(bytes: &[u8]) -> Result<(Vec<f32>, u64, u32)> {
 	Ok((pcm, spec.sample_rate as u64, spec.channels as u32))
 }
 
-fn pcm_to_vorbis(pcm: Vec<f32>, rate: u64, channels: u32) -> Result<Vec<u8>> {
+fn pcm_to_vorbis(pcm: Vec<f32>, rate: u64, channels: u32, quality: u8) -> Result<Vec<u8>> {
 	use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
 
 	let channels = channels as usize;
@@ -128,8 +138,7 @@ fn pcm_to_vorbis(pcm: Vec<f32>, rate: u64, channels: u32) -> Result<Vec<u8>> {
 		&mut bytes,
 	)?
 	.bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr {
-		// maybe i will make this configurable
-		target_quality: 0.4,
+		target_quality: quality as f32 / 100.0,
 	})
 	.build()?
 	.encode_audio_block(
