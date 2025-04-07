@@ -9,43 +9,39 @@ use vorbis_rs::VorbisDecoder;
 pub enum AudioKind {
 	Vorbis,
 	Wave,
-	Mpeg3,
+	MP3,
 }
 
 pub fn optimise(bytes: &[u8], kind: AudioKind) -> Result<Option<Vec<u8>>> {
-	match kind {
-		AudioKind::Vorbis => {
-			let mut settings = VorbisOptimizerSettings::default();
-			settings.comment_fields_action = optivorbis::VorbisCommentFieldsAction::Delete;
-			settings.vendor_string_action = optivorbis::VorbisVendorStringAction::Empty;
-
-			let options = Settings {
-				error_on_no_vorbis_streams: false,
-				// not sure how safe this is for osu skins
-				ignore_start_sample_offset: true,
-				..Default::default()
-			};
-
-			let encoder = optivorbis::OggToOgg::new(options, settings);
-			let mut output = Vec::with_capacity(bytes.len());
-			encoder.remux(Cursor::new(bytes), &mut output)?;
-			if output.len() >= bytes.len() {
-				Ok(None)
-			} else {
-				Ok(Some(output))
-			}
-		}
-		_ => Ok(None),
+	if kind != AudioKind::Vorbis {
+		return Ok(None);
 	}
+
+	let mut settings = VorbisOptimizerSettings::default();
+	settings.comment_fields_action = optivorbis::VorbisCommentFieldsAction::Delete;
+	settings.vendor_string_action = optivorbis::VorbisVendorStringAction::Empty;
+
+	let options = Settings {
+		error_on_no_vorbis_streams: false,
+		// dunno how safe this is for osu skins. may cause delay?
+		ignore_start_sample_offset: true,
+		..Default::default()
+	};
+
+	let encoder = optivorbis::OggToOgg::new(options, settings);
+	let mut output = Vec::with_capacity(bytes.len());
+	encoder.remux(Cursor::new(bytes), &mut output)?;
+
+	Ok((output.len() < bytes.len()).then_some(output))
 }
 
-pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind, quality: u8) -> Result<Vec<u8>> {
+pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind, quality: u8) -> Result<Option<Vec<u8>>> {
 	if bytes.is_empty() {
 		eyre::bail!("this is an empty file");
 	}
 
 	let (pcm_data, sample_rate, channels) = match kind {
-		AudioKind::Mpeg3 => mp3_to_pcm(bytes)?,
+		AudioKind::MP3 => mp3_to_pcm(bytes)?,
 		AudioKind::Wave => wav_to_pcm(bytes)?,
 		AudioKind::Vorbis => vorbis_to_pcm(bytes)?,
 	};
@@ -55,10 +51,10 @@ pub fn convert_to_vorbis(bytes: &[u8], kind: AudioKind, quality: u8) -> Result<V
 	}
 
 	if matches!(kind, AudioKind::Vorbis) {
-		return Ok(bytes.to_vec());
+		return Ok(None);
 	}
 
-	pcm_to_vorbis(pcm_data, sample_rate, channels, quality)
+	pcm_to_vorbis(pcm_data, sample_rate, channels, quality).map(Some)
 }
 
 fn is_silent(pcm_data: &[f32]) -> bool {
@@ -132,19 +128,22 @@ fn pcm_to_vorbis(pcm: Vec<f32>, rate: u64, channels: u32, quality: u8) -> Result
 	let channels = channels as usize;
 	let mut bytes = Vec::with_capacity(pcm.len() * 4);
 
-	VorbisEncoderBuilder::new(
+	VorbisEncoderBuilder::new_with_serial(
 		(rate as u32).try_into()?,
 		(channels as u8).try_into()?,
 		&mut bytes,
-	)?
+		0,
+	)
 	.bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr {
 		target_quality: quality as f32 / 100.0,
 	})
 	.build()?
 	.encode_audio_block(
-		&(0..channels)
+		// this sucks
+		(0..channels)
 			.map(|i| {
-				pcm.iter()
+				pcm
+					.iter()
 					.skip(i)
 					.step_by(channels)
 					.copied()
